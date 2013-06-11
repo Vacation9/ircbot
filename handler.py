@@ -2,22 +2,22 @@ from config import ADMINS, CHANNEL
 import re
 import os
 from glob import glob
-import lxml.html
-import urllib.request
-import sys
+from lxml.html import parse
+from urllib.request import urlopen, Request
+from urllib.error import URLError
 import json
 import importlib
 import imp
-
-
-def isadmin(nick):
-    return nick in ADMINS
+import time
+import socket
 
 
 class MyHandler():
     def __init__(self):
         self.ignored = []
         self.modules = self.loadmodules()
+        self.abuselist = {}
+        self.scorefile = os.path.dirname(__file__)+'/score'
 
     def loadmodules(self):
         modulemap = {}
@@ -30,10 +30,34 @@ class MyHandler():
             modulemap[cmd] = importlib.import_module("commands."+cmd)
         return modulemap
 
+    def ignore(self, c, nick):
+        if nick in self.ignored:
+            return
+        self.ignored.append(nick)
+        c.privmsg(CHANNEL,
+                  "Now igoring %s." % nick)
+
+    def abusecheck(self, c, e, limit):
+        nick = e.source.nick
+        if nick not in self.abuselist:
+            self.abuselist[nick] = [time.time()]
+        else:
+            self.abuselist[nick].append(time.time())
+        count = 0
+        for x in self.abuselist[nick]:
+            # 30 seconds - arbitrary cuttoff
+            if (time.time() - x) < 30:
+                count = count + 1
+        if count > limit:
+            c.privmsg(CHANNEL, "%s is a Bot Abuser" % nick)
+            self.ignore(c, nick)
+            return False
+        return True
+
     def pubmsg(self, c, e):
         nick = e.source.nick
         msg = e.arguments[0].strip()
-        if not isadmin(nick):
+        if nick not in ADMINS:
             for nick in self.ignored:
                 print("Ignoring!")
                 return
@@ -44,9 +68,12 @@ class MyHandler():
             if cmd[1:] in self.modules:
                 mod = self.modules[cmd[1:]]
                 try:
-                    mod.cmd(e, c, args)
+                    if hasattr(mod, 'limit') and self.abusecheck(c, e, mod.limit):
+                            mod.cmd(e, c, args)
+                    else:
+                            mod.cmd(e, c, args)
                 except Exception as ex:
-                    c.privmsg(CHANNEL, 'Exception: ' + str(ex))
+                    c.privmsg(CHANNEL, '%s: %s' % (type(ex), str(ex)))
                 return
 
         #special commands
@@ -56,35 +83,29 @@ class MyHandler():
                 cmdlist = ' !'.join([x for x in sorted(self.modules)])
                 c.privmsg(CHANNEL, 'Commands: !' + cmdlist)
             # everything below this point requires admin
-            if not isadmin(nick):
-                return
-            if cmd[1:] == 'reload':
-                c.privmsg(CHANNEL, "Aye Aye Capt'n")
-                self.modules = self.loadmodules()
-                for x in self.modules.values():
-                    imp.reload(x)
-                return
-            elif cmd[1:] == 'quit':
-                c.quit("Goodbye, Cruel World!")
-                sys.exit(0)
-                return
-            elif cmd[1:] == 'cignore':
-                self.ignored = []
-                c.privmsg(CHANNEL, "Ignore list cleared.")
-            elif cmd[1:] == 'ignore':
-                if args in self.ignored:
+            if nick in ADMINS:
+                if cmd[1:] == 'reload':
+                    c.privmsg(CHANNEL, "Aye Aye Capt'n")
+                    self.modules = self.loadmodules()
+                    for x in self.modules.values():
+                        imp.reload(x)
                     return
-                self.ignored.append(args)
-                c.privmsg(CHANNEL,
-                          "Now igoring %s." % args)
-            elif cmd[1:] == 'join':
-                c.join(args)
-                c.privmsg(args, "Joined at the request of " + nick)
-
+                elif cmd[1:] == 'cignore':
+                    self.ignored = []
+                    c.privmsg(CHANNEL, "Ignore list cleared.")
+                elif cmd[1:] == 'ignore':
+                    self.ignore(c, args)
+                #FIXME: CHANNEL is hardcoded in config.py
+                elif cmd[1:] == 'join':
+                    c.join(args)
+                    c.privmsg(args, "Joined at the request of " + nick)
+                elif cmd[1:] == 'part':
+                    c.privmsg(args, "Leaving at the request of " + nick)
+                    c.part(args)
         # ++ and --
         match = re.search(r"([a-zA-Z0-9]+)(\+\+|--)", msg)
         if match:
-            name = match.group(1)
+            name = match.group(1).lower()
             if "+" in match.group(2):
                 score = 1
                 if name == nick:
@@ -93,15 +114,15 @@ class MyHandler():
                     score = -10
             else:
                 score = -1
-            if os.path.isfile("score"):
-                scores = json.load(open("score"))
+            if os.path.isfile(self.scorefile):
+                scores = json.load(open(self.scorefile))
             else:
                 scores = {}
             if name in scores:
                 scores[name] += score
             else:
                 scores[name] = score
-            f = open("score", "w")
+            f = open(self.scorefile, "w")
             json.dump(scores, f)
             f.close()
             return
@@ -109,6 +130,23 @@ class MyHandler():
         # crazy regex to match urls
         match = re.match(r"(?i)\b((?:https?://|www\d{0,3}[.]|[a-z0-9.\-]+[.][a-z]{2,4}/)(?:[^\s()<>]+|\(([^\s()<>]+|(\([^\s()<>]+\)))*\))+(?:\(([^\s()<>]+|(\([^\s()<>]+\)))*\)|[^\s`!()\[\]{};:'\".,<>?«»....]))", msg)
         if match:
-            t = lxml.html.parse(urllib.request.urlopen(match.group(1), timeout=1))
-            c.privmsg(CHANNEL, t.find(".//title").text)
-            return
+            try:
+                url = match.group(1)
+                if not url.startswith('http'):
+                    url = 'http://' + url
+                # Wikipedia doesn't like the default User-Agent
+                req = Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                t = parse(urlopen(req, timeout=2))
+                c.privmsg(CHANNEL, t.find(".//title").text)
+            except URLError as ex:
+                # website does not exist
+                if hasattr(ex.reason, 'errno') and ex.reason.errno == socket.EAI_NONAME:
+                    return
+                else:
+                    c.privmsg(CHANNEL, '%s: %s' % (type(ex), str(ex)))
+            # page does not contain a title
+            except AttributeError:
+                return
+            except Exception as ex:
+                    c.privmsg(CHANNEL, '%s: %s' % (type(ex), str(ex)))
+        return
